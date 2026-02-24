@@ -1,0 +1,934 @@
+import kagglehub
+
+# Download latest version
+path = kagglehub.dataset_download("mateuszbuda/lgg-mri-segmentation")
+
+print("Path to dataset files:", path)
+
+
+# ============================================================
+# IMPORTS
+# ============================================================
+import os
+import glob
+import random
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import seaborn as sns
+import cv2
+from pathlib import Path
+from PIL import Image
+from tqdm import tqdm
+import warnings
+warnings.filterwarnings('ignore')
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as transforms
+from torchvision.utils import make_grid
+
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (confusion_matrix, classification_report,
+                             roc_auc_score, average_precision_score,
+                             roc_curve, precision_recall_curve)
+from einops import rearrange
+
+# GPU Setup
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f'🚀 Using device: {device}')
+if torch.cuda.is_available():
+    print(f'   GPU: {torch.cuda.get_device_name(0)}')
+    print(f'   VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB')
+
+# Reproducibility
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+
+
+
+import os, glob
+
+DATA_DIR = '/kaggle/input/datasets/mateuszbuda/lgg-mri-segmentation/kaggle_3m'
+
+# Recursively find all patient folders
+patient_folders = [f.path for f in os.scandir(DATA_DIR) if f.is_dir()]
+
+all_images = []
+all_masks = []
+
+for folder in patient_folders:
+    # Collect all files ending with _mask.tif or _mask.ti
+    images = sorted(glob.glob(os.path.join(folder, "*.tif")))
+    for img in images:
+        if "_mask" in img:
+            all_masks.append(img)
+        else:
+            all_images.append(img)
+
+# Sort to keep order consistent
+all_images = sorted(all_images)
+all_masks  = sorted(all_masks)
+
+print(f"📊 Total images: {len(all_images)}")
+print(f"📊 Total masks:  {len(all_masks)}")
+
+if len(all_images) > 0:
+    print("Example image:", all_images[0])
+    print("Example mask :", all_masks[0])
+
+
+
+
+# ============================================================
+# EXPLORATORY DATA ANALYSIS
+# ============================================================
+fig, axes = plt.subplots(2, 5, figsize=(20, 8))
+fig.suptitle('🧠 LGG MRI Dataset — Sample Visualization', fontsize=16, fontweight='bold')
+
+indices = random.sample(range(len(all_images)), min(5, len(all_images)))
+for col, idx in enumerate(indices):
+    img = cv2.imread(all_images[idx])
+    if img is not None:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    else:
+        img = np.zeros((256, 256, 3), dtype=np.uint8)
+    
+    mask = cv2.imread(all_masks[idx], 0) if os.path.exists(all_masks[idx]) else np.zeros((256,256), dtype=np.uint8)
+    
+    axes[0, col].imshow(img)
+    axes[0, col].set_title(f'MRI Scan {idx}', fontsize=9)
+    axes[0, col].axis('off')
+    
+    overlay = img.copy()
+    if mask is not None and mask.max() > 0:
+        overlay[mask > 127] = [255, 50, 50]
+    axes[1, col].imshow(overlay)
+    axes[1, col].set_title(f'+ Tumor Mask', fontsize=9)
+    axes[1, col].axis('off')
+
+plt.tight_layout()
+plt.savefig('eda_samples.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+# Statistics
+tumor_count = sum(1 for m in all_masks if os.path.exists(m) and cv2.imread(m, 0) is not None and cv2.imread(m, 0).max() > 0)
+print(f'\n📈 Dataset Statistics:')
+print(f'   Total samples: {len(all_images)}')
+print(f'   With tumor: {tumor_count} ({100*tumor_count/max(1,len(all_images)):.1f}%)')
+print(f'   Without tumor: {len(all_images)-tumor_count}')
+
+
+
+
+# ============================================================
+# DATASET & AUGMENTATIONS
+# ============================================================
+IMG_SIZE = 256
+BATCH_SIZE = 16
+
+train_transform = A.Compose([
+    A.Resize(IMG_SIZE, IMG_SIZE),
+    A.HorizontalFlip(p=0.5),
+    A.VerticalFlip(p=0.3),
+    A.Rotate(limit=30, p=0.5),
+    A.ElasticTransform(alpha=120, sigma=120*0.05, p=0.3),
+    A.GridDistortion(p=0.3),
+    A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
+    A.GaussNoise(var_limit=(10, 50), p=0.3),
+    A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ToTensorV2()
+])
+
+val_transform = A.Compose([
+    A.Resize(IMG_SIZE, IMG_SIZE),
+    A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ToTensorV2()
+])
+
+class BrainMRIDataset(Dataset):
+    def __init__(self, image_paths, mask_paths, transform=None):
+        self.image_paths = image_paths
+        self.mask_paths = mask_paths
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        img = cv2.imread(self.image_paths[idx])
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB) if img is not None else np.zeros((256,256,3), np.uint8)
+        
+        mask_path = self.mask_paths[idx]
+        mask = cv2.imread(mask_path, 0) if os.path.exists(mask_path) else np.zeros((img.shape[0], img.shape[1]), np.uint8)
+        if mask is None:
+            mask = np.zeros((img.shape[0], img.shape[1]), np.uint8)
+        
+        mask = (mask > 127).astype(np.uint8)
+
+        if self.transform:
+            aug = self.transform(image=img, mask=mask)
+            img, mask = aug['image'], aug['mask']
+        
+        return img.float(), mask.long()
+
+# Train/Val/Test split
+pairs = list(zip(all_images, all_masks))
+train_pairs, test_pairs = train_test_split(pairs, test_size=0.15, random_state=SEED)
+train_pairs, val_pairs = train_test_split(train_pairs, test_size=0.15, random_state=SEED)
+
+train_imgs, train_msks = zip(*train_pairs) if train_pairs else ([], [])
+val_imgs, val_msks = zip(*val_pairs) if val_pairs else ([], [])
+test_imgs, test_msks = zip(*test_pairs) if test_pairs else ([], [])
+
+train_dataset = BrainMRIDataset(list(train_imgs), list(train_msks), train_transform)
+val_dataset   = BrainMRIDataset(list(val_imgs),   list(val_msks),   val_transform)
+test_dataset  = BrainMRIDataset(list(test_imgs),  list(test_msks),  val_transform)
+
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,  num_workers=4, pin_memory=True)
+val_loader   = DataLoader(val_dataset,   batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
+test_loader  = DataLoader(test_dataset,  batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
+
+print(f'✅ Train: {len(train_dataset)} | Val: {len(val_dataset)} | Test: {len(test_dataset)}')
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# ----------------------
+# Attention Modules
+# ----------------------
+class SqueezeExcitation(nn.Module):
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.se = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(channels, channels // reduction),
+            nn.ReLU(),
+            nn.Linear(channels // reduction, channels),
+            nn.Sigmoid()
+        )
+    def forward(self, x):
+        w = self.se(x).view(x.shape[0], x.shape[1], 1, 1)
+        return x * w
+
+class SpatialAttention(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv = nn.Conv2d(2, 1, 7, padding=3)
+        self.sigmoid = nn.Sigmoid()
+    def forward(self, x):
+        avg = torch.mean(x, dim=1, keepdim=True)
+        mx, _ = torch.max(x, dim=1, keepdim=True)
+        attn = self.sigmoid(self.conv(torch.cat([avg, mx], dim=1)))
+        return x * attn
+
+class DualAttentionGate(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.se = SqueezeExcitation(channels)
+        self.sa = SpatialAttention()
+    def forward(self, x):
+        x = self.se(x)
+        x = self.sa(x)
+        return x
+
+# ----------------------
+# ResNeXt Block
+# ----------------------
+class ResNeXtBlock(nn.Module):
+    """Multi-branch ResNeXt-style convolution"""
+    def __init__(self, in_ch, out_ch, groups=8, stride=1):
+        super().__init__()
+        # Only use groups if in_ch and out_ch >= groups
+        use_groups = groups if in_ch >= groups and out_ch >= groups else 1
+        mid_ch = out_ch
+        self.branch1 = nn.Sequential(
+            nn.Conv2d(in_ch, mid_ch, 3, stride, 1, groups=use_groups, bias=False),
+            nn.BatchNorm2d(mid_ch), nn.GELU()
+        )
+        self.branch2 = nn.Sequential(
+            nn.Conv2d(in_ch, mid_ch, 5, stride, 2, groups=use_groups, bias=False),
+            nn.BatchNorm2d(mid_ch), nn.GELU()
+        )
+        self.fuse = nn.Sequential(
+            nn.Conv2d(mid_ch * 2, out_ch, 1, bias=False),
+            nn.BatchNorm2d(out_ch), nn.GELU()
+        )
+        self.skip = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 1, stride, bias=False),
+            nn.BatchNorm2d(out_ch)
+        ) if in_ch != out_ch or stride != 1 else nn.Identity()
+        self.act = nn.GELU()
+
+    def forward(self, x):
+        b1 = self.branch1(x)
+        b2 = self.branch2(x)
+        out = self.fuse(torch.cat([b1, b2], dim=1))
+        return self.act(out + self.skip(x))
+
+# ----------------------
+# SSM Token Mixer
+# ----------------------
+class SSMTokenMixer(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.gru_h = nn.GRU(dim, dim, batch_first=True, bidirectional=True)
+        self.gru_w = nn.GRU(dim, dim, batch_first=True, bidirectional=True)
+        self.proj = nn.Linear(dim * 4, dim)
+        self.drop = nn.Dropout(0.1)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        x_flat = rearrange(x, 'b c h w -> b (h w) c')
+        x_norm = self.norm(x_flat)
+
+        x_h = rearrange(x_norm, 'b (h w) c -> (b h) w c', h=H, w=W)
+        out_h, _ = self.gru_h(x_h)
+        out_h = rearrange(out_h, '(b h) w c -> b (h w) c', b=B, h=H)
+
+        x_v = rearrange(x_norm, 'b (h w) c -> (b w) h c', h=H, w=W)
+        out_v, _ = self.gru_w(x_v)
+        out_v = rearrange(out_v, '(b w) h c -> b (h w) c', b=B, w=W)
+
+        out = torch.cat([out_h, out_v], dim=-1)
+        out = self.drop(self.proj(out))
+        out = out + x_flat
+        return rearrange(out, 'b (h w) c -> b c h w', h=H, w=W)
+
+# ----------------------
+# ASPP
+# ----------------------
+class ASPP(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.branches = nn.ModuleList([
+            nn.Sequential(nn.AdaptiveAvgPool2d(1),
+                          nn.Conv2d(in_ch, out_ch, 1), nn.BatchNorm2d(out_ch), nn.GELU()),
+            nn.Sequential(nn.Conv2d(in_ch, out_ch, 1), nn.BatchNorm2d(out_ch), nn.GELU()),
+            nn.Sequential(nn.Conv2d(in_ch, out_ch, 3, padding=6, dilation=6), nn.BatchNorm2d(out_ch), nn.GELU()),
+            nn.Sequential(nn.Conv2d(in_ch, out_ch, 3, padding=12, dilation=12), nn.BatchNorm2d(out_ch), nn.GELU()),
+            nn.Sequential(nn.Conv2d(in_ch, out_ch, 3, padding=18, dilation=18), nn.BatchNorm2d(out_ch), nn.GELU()),
+        ])
+        self.fuse = nn.Sequential(
+            nn.Conv2d(out_ch*5, out_ch, 1), nn.BatchNorm2d(out_ch), nn.GELU()
+        )
+
+    def forward(self, x):
+        H, W = x.shape[2:]
+        outs = []
+        for i, branch in enumerate(self.branches):
+            out = branch(x)
+            if i == 0:
+                out = F.interpolate(out, (H, W), mode='bilinear', align_corners=True)
+            outs.append(out)
+        return self.fuse(torch.cat(outs, dim=1))
+
+# ----------------------
+# Decoder Block
+# ----------------------
+class DecoderBlock(nn.Module):
+    def __init__(self, in_ch, skip_ch, out_ch):
+        super().__init__()
+        self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.gate = DualAttentionGate(skip_ch)
+        self.conv = nn.Sequential(
+            ResNeXtBlock(in_ch + skip_ch, out_ch),
+            ResNeXtBlock(out_ch, out_ch)
+        )
+        # deep supervision should match out_ch, not in_ch + skip_ch
+        self.deep_sup = nn.Conv2d(out_ch, 2, 1)
+
+    def forward(self, x, skip):
+        x = self.upsample(x)
+        skip = self.gate(skip)
+        x = torch.cat([x, skip], dim=1)
+        x = self.conv(x)
+        ds = self.deep_sup(x)
+        return x, ds
+
+# ----------------------
+# Full HybridFormerUNet
+# ----------------------
+class HybridFormerUNet(nn.Module):
+    def __init__(self, in_ch=3, num_classes=2):
+        super().__init__()
+        # Encoder
+        self.enc1 = nn.Sequential(ResNeXtBlock(in_ch, 64),  ResNeXtBlock(64, 64))
+        self.enc2 = nn.Sequential(ResNeXtBlock(64, 128, stride=2), ResNeXtBlock(128, 128))
+        self.enc3 = nn.Sequential(ResNeXtBlock(128, 256, stride=2), ResNeXtBlock(256, 256))
+        self.enc4 = nn.Sequential(ResNeXtBlock(256, 512, stride=2), ResNeXtBlock(512, 512))
+
+        # Bottleneck
+        self.pool = nn.MaxPool2d(2)
+        self.aspp = ASPP(512, 256)
+        self.ssm = SSMTokenMixer(256)
+        self.bottleneck_conv = ResNeXtBlock(256, 512)
+
+        # Decoder
+        self.dec4 = DecoderBlock(512, 512, 256)
+        self.dec3 = DecoderBlock(256, 256, 128)
+        self.dec2 = DecoderBlock(128, 128, 64)
+        self.dec1 = DecoderBlock(64, 64, 32)
+
+        self.final = nn.Conv2d(32, num_classes, 1)
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        s1 = self.enc1(x)
+        s2 = self.enc2(s1)
+        s3 = self.enc3(s2)
+        s4 = self.enc4(s3)
+
+        b = self.pool(s4)
+        b = self.aspp(b)
+        b = self.ssm(b)
+        b = self.bottleneck_conv(b)
+
+        d4, ds4 = self.dec4(b, s4)
+        d3, ds3 = self.dec3(d4, s3)
+        d2, ds2 = self.dec2(d3, s2)
+        d1, ds1 = self.dec1(d2, s1)
+
+        out = self.final(d1)
+        return out, [ds4, ds3, ds2, ds1]
+
+# ----------------------
+# Test
+# ----------------------
+model = HybridFormerUNet(in_ch=3, num_classes=2).to(device)
+dummy = torch.randn(2, 3, 256, 256).to(device)
+out, ds_outs = model(dummy)
+print(f'✅ HybridFormerUNet')
+print(f'   Input:  {dummy.shape}')
+print(f'   Output: {out.shape}')
+print(f'   Deep supervision: {[d.shape for d in ds_outs]}')
+total_params = sum(p.numel() for p in model.parameters())
+print(f'   Parameters: {total_params/1e6:.2f}M')
+
+
+
+# ============================================================
+# LOSS FUNCTIONS & METRICS
+# ============================================================
+
+class DiceLoss(nn.Module):
+    def __init__(self, smooth=1e-6):
+        super().__init__()
+        self.smooth = smooth
+
+    def forward(self, pred, target):
+        pred = F.softmax(pred, dim=1)[:, 1]  # tumor channel
+        target = target.float()
+        intersection = (pred * target).sum(dim=(1,2))
+        dice = (2*intersection + self.smooth) / (pred.sum(dim=(1,2)) + target.sum(dim=(1,2)) + self.smooth)
+        return 1 - dice.mean()
+
+
+class HybridLoss(nn.Module):
+    """CE + Dice + deep supervision"""
+    def __init__(self, weights=(0.4, 0.6), ds_weight=0.3):
+        super().__init__()
+        self.ce = nn.CrossEntropyLoss()
+        self.dice = DiceLoss()
+        self.w = weights
+        self.ds_w = ds_weight
+
+    def forward(self, pred, ds_preds, target):
+        main_loss = self.w[0]*self.ce(pred, target) + self.w[1]*self.dice(pred, target)
+        # Deep supervision losses
+        ds_loss = 0
+        for ds in ds_preds:
+            ds_resized = F.interpolate(ds, size=target.shape[1:], mode='bilinear', align_corners=True)
+            ds_loss += 0.5*self.ce(ds_resized, target) + 0.5*self.dice(ds_resized, target)
+        ds_loss /= len(ds_preds)
+        return main_loss + self.ds_w * ds_loss
+
+
+def compute_metrics(pred_mask, true_mask, threshold=0.5):
+    """Compute Dice, IoU, Precision, Recall, F1"""
+    pred = (pred_mask > threshold).astype(np.float32)
+    true = true_mask.astype(np.float32)
+    
+    tp = (pred * true).sum()
+    fp = (pred * (1 - true)).sum()
+    fn = ((1 - pred) * true).sum()
+    
+    smooth = 1e-6
+    dice = (2*tp + smooth) / (2*tp + fp + fn + smooth)
+    iou  = (tp + smooth) / (tp + fp + fn + smooth)
+    prec = (tp + smooth) / (tp + fp + smooth)
+    rec  = (tp + smooth) / (tp + fn + smooth)
+    f1   = 2 * prec * rec / (prec + rec + smooth)
+    return {'dice': dice, 'iou': iou, 'precision': prec, 'recall': rec, 'f1': f1}
+
+print('✅ Loss functions and metrics ready')
+
+
+
+# ============================================================
+# TRAINING LOOP
+# ============================================================
+EPOCHS = 5
+LR = 3e-4
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2)
+criterion = HybridLoss()
+scaler = torch.cuda.amp.GradScaler()  # Mixed precision
+
+history = {'train_loss': [], 'val_loss': [], 'val_dice': [], 'val_iou': [], 'lr': []}
+best_dice = 0
+
+for epoch in range(1, EPOCHS + 1):
+    # ---- TRAIN ----
+    model.train()
+    train_loss = 0
+    pbar = tqdm(train_loader, desc=f'Epoch {epoch}/{EPOCHS}', leave=False)
+    for imgs, masks in pbar:
+        imgs, masks = imgs.to(device), masks.to(device)
+        optimizer.zero_grad()
+        with torch.cuda.amp.autocast():
+            pred, ds_preds = model(imgs)
+            loss = criterion(pred, ds_preds, masks)
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        scaler.step(optimizer)
+        scaler.update()
+        train_loss += loss.item()
+        pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+    scheduler.step()
+
+    # ---- VALIDATE ----
+    model.eval()
+    val_loss, all_dice, all_iou = 0, [], []
+    with torch.no_grad():
+        for imgs, masks in val_loader:
+            imgs, masks = imgs.to(device), masks.to(device)
+            with torch.cuda.amp.autocast():
+                pred, ds_preds = model(imgs)
+                loss = criterion(pred, ds_preds, masks)
+            val_loss += loss.item()
+            pred_prob = F.softmax(pred, dim=1)[:, 1].cpu().numpy()
+            true_np   = masks.cpu().numpy()
+            for p, t in zip(pred_prob, true_np):
+                m = compute_metrics(p, t)
+                all_dice.append(m['dice'])
+                all_iou.append(m['iou'])
+
+    avg_train_loss = train_loss / len(train_loader)
+    avg_val_loss   = val_loss   / len(val_loader)
+    avg_dice = np.mean(all_dice)
+    avg_iou  = np.mean(all_iou)
+    current_lr = optimizer.param_groups[0]['lr']
+
+    history['train_loss'].append(avg_train_loss)
+    history['val_loss'].append(avg_val_loss)
+    history['val_dice'].append(avg_dice)
+    history['val_iou'].append(avg_iou)
+    history['lr'].append(current_lr)
+
+    if avg_dice > best_dice:
+        best_dice = avg_dice
+        torch.save(model.state_dict(), 'best_hybridformerunet.pth')
+    
+    if epoch % 5 == 0:
+        print(f'Epoch {epoch:3d} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | '
+              f'Dice: {avg_dice:.4f} | IoU: {avg_iou:.4f} | LR: {current_lr:.2e}')
+
+print(f'\n🏆 Best Validation Dice: {best_dice:.4f}')
+
+
+
+
+# ============================================================
+# TRAINING CURVES VISUALIZATION
+# ============================================================
+fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+fig.suptitle('📈 HybridFormerUNet Training History', fontsize=14, fontweight='bold')
+
+epochs_range = range(1, len(history['train_loss']) + 1)
+
+axes[0].plot(epochs_range, history['train_loss'], label='Train Loss', color='#e74c3c', linewidth=2)
+axes[0].plot(epochs_range, history['val_loss'],   label='Val Loss',   color='#3498db', linewidth=2)
+axes[0].set_xlabel('Epoch'); axes[0].set_ylabel('Loss')
+axes[0].set_title('Loss Curves')
+axes[0].legend(); axes[0].grid(alpha=0.3)
+
+axes[1].plot(epochs_range, history['val_dice'], label='Dice',  color='#2ecc71', linewidth=2)
+axes[1].plot(epochs_range, history['val_iou'],  label='IoU',   color='#f39c12', linewidth=2)
+axes[1].set_xlabel('Epoch'); axes[1].set_ylabel('Score')
+axes[1].set_title('Validation Metrics')
+axes[1].legend(); axes[1].grid(alpha=0.3)
+
+axes[2].semilogy(epochs_range, history['lr'], color='#9b59b6', linewidth=2)
+axes[2].set_xlabel('Epoch'); axes[2].set_ylabel('Learning Rate')
+axes[2].set_title('LR Schedule (Cosine Warm Restart)')
+axes[2].grid(alpha=0.3)
+
+plt.tight_layout()
+plt.savefig('training_curves.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+
+
+
+# ============================================================
+# COMPREHENSIVE EVALUATION ON TEST SET
+# ============================================================
+model.load_state_dict(torch.load('best_hybridformerunet.pth', map_location=device))
+model.eval()
+
+all_preds_prob = []
+all_true = []
+all_imgs_for_viz = []
+
+with torch.no_grad():
+    for imgs, masks in test_loader:
+        imgs_gpu = imgs.to(device)
+        pred, _ = model(imgs_gpu)
+        prob = F.softmax(pred, dim=1)[:, 1].cpu().numpy()
+        all_preds_prob.append(prob)
+        all_true.append(masks.numpy())
+        if len(all_imgs_for_viz) < 8:
+            all_imgs_for_viz.extend([(imgs[i].numpy(), masks[i].numpy(), prob[i]) 
+                                     for i in range(min(8-len(all_imgs_for_viz), len(imgs)))])
+
+all_preds_prob = np.concatenate(all_preds_prob)
+all_true       = np.concatenate(all_true)
+
+# Compute all metrics
+metrics_list = [compute_metrics(p, t) for p, t in zip(all_preds_prob, all_true)]
+metrics_df = pd.DataFrame(metrics_list)
+
+print('\n' + '='*50)
+print('📊 TEST SET EVALUATION RESULTS')
+print('='*50)
+for metric in ['dice', 'iou', 'precision', 'recall', 'f1']:
+    vals = metrics_df[metric]
+    print(f'{metric.capitalize():12s}: {vals.mean():.4f} ± {vals.std():.4f}')
+
+# Pixel-level binary metrics
+pred_binary = (all_preds_prob > 0.5).astype(int)
+flat_pred = pred_binary.flatten()
+flat_true = all_true.flatten()
+
+# ROC
+auc_score = roc_auc_score(flat_true, all_preds_prob.flatten())
+ap_score  = average_precision_score(flat_true, all_preds_prob.flatten())
+print(f'{'AUC-ROC':12s}: {auc_score:.4f}')
+print(f'{'Avg Precision':12s}: {ap_score:.4f}')
+
+
+
+
+# ============================================================
+# EVALUATION VISUALIZATIONS
+# ============================================================
+
+fig = plt.figure(figsize=(20, 16))
+fig.suptitle('📊 Comprehensive Evaluation — HybridFormerUNet', fontsize=16, fontweight='bold')
+
+gs = gridspec.GridSpec(3, 4, figure=fig, hspace=0.4, wspace=0.3)
+
+# --- ROC Curve ---
+ax_roc = fig.add_subplot(gs[0, 0])
+fpr, tpr, _ = roc_curve(flat_true[:500000], all_preds_prob.flatten()[:500000])  # subsample for speed
+ax_roc.plot(fpr, tpr, color='#e74c3c', lw=2, label=f'AUC = {auc_score:.4f}')
+ax_roc.plot([0,1], [0,1], 'k--', lw=1)
+ax_roc.set_xlabel('FPR'); ax_roc.set_ylabel('TPR')
+ax_roc.set_title('ROC Curve'); ax_roc.legend(); ax_roc.grid(alpha=0.3)
+
+# --- PR Curve ---
+ax_pr = fig.add_subplot(gs[0, 1])
+prec_c, rec_c, _ = precision_recall_curve(flat_true[:500000], all_preds_prob.flatten()[:500000])
+ax_pr.plot(rec_c, prec_c, color='#3498db', lw=2, label=f'AP = {ap_score:.4f}')
+ax_pr.set_xlabel('Recall'); ax_pr.set_ylabel('Precision')
+ax_pr.set_title('Precision-Recall Curve'); ax_pr.legend(); ax_pr.grid(alpha=0.3)
+
+# --- Metrics Bar Plot ---
+ax_bar = fig.add_subplot(gs[0, 2])
+metric_names = ['Dice', 'IoU', 'Precision', 'Recall', 'F1']
+metric_vals  = [metrics_df['dice'].mean(), metrics_df['iou'].mean(),
+                metrics_df['precision'].mean(), metrics_df['recall'].mean(),
+                metrics_df['f1'].mean()]
+colors = ['#e74c3c', '#3498db', '#2ecc71', '#f39c12', '#9b59b6']
+bars = ax_bar.bar(metric_names, metric_vals, color=colors, alpha=0.8, edgecolor='white')
+for bar, val in zip(bars, metric_vals):
+    ax_bar.text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.01, f'{val:.3f}',
+                ha='center', va='bottom', fontweight='bold', fontsize=9)
+ax_bar.set_ylim(0, 1.1); ax_bar.set_title('Segmentation Metrics')
+ax_bar.grid(axis='y', alpha=0.3)
+
+# --- Dice Distribution ---
+ax_hist = fig.add_subplot(gs[0, 3])
+ax_hist.hist(metrics_df['dice'], bins=20, color='#2ecc71', alpha=0.8, edgecolor='white')
+ax_hist.axvline(metrics_df['dice'].mean(), color='red', linestyle='--', label=f'Mean={metrics_df["dice"].mean():.3f}')
+ax_hist.set_xlabel('Dice Score'); ax_hist.set_ylabel('Count')
+ax_hist.set_title('Dice Score Distribution'); ax_hist.legend(); ax_hist.grid(alpha=0.3)
+
+# --- Sample Predictions (4 samples) ---
+mean = np.array([0.485, 0.456, 0.406])
+std  = np.array([0.229, 0.224, 0.225])
+
+for col, (img_np, mask_np, pred_prob) in enumerate(all_imgs_for_viz[:4]):
+    ax = fig.add_subplot(gs[1, col])
+    img_show = (img_np.transpose(1,2,0) * std + mean).clip(0,1)
+    pred_bin  = (pred_prob > 0.5).astype(np.uint8)
+    
+    overlay = img_show.copy()
+    overlay[pred_bin == 1] = overlay[pred_bin == 1] * 0.5 + np.array([1,0,0]) * 0.5  # red = prediction
+    overlay[mask_np == 1] = overlay[mask_np == 1] * 0.5 + np.array([0,1,0]) * 0.5   # green = GT
+    ax.imshow(overlay)
+    m = compute_metrics(pred_prob, mask_np)
+    ax.set_title(f'Dice={m["dice"]:.3f} IoU={m["iou"]:.3f}', fontsize=9)
+    ax.axis('off')
+    if col == 0:
+        ax.set_ylabel('Red=Pred Green=GT', fontsize=8)
+
+# --- Probability Heatmaps ---
+for col, (img_np, mask_np, pred_prob) in enumerate(all_imgs_for_viz[:4]):
+    ax = fig.add_subplot(gs[2, col])
+    im = ax.imshow(pred_prob, cmap='hot', vmin=0, vmax=1)
+    ax.contour(mask_np, levels=[0.5], colors='cyan', linewidths=1)
+    ax.set_title('Probability Map + GT contour', fontsize=8)
+    ax.axis('off')
+    plt.colorbar(im, ax=ax, shrink=0.8)
+
+plt.savefig('evaluation_results.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+
+
+
+# ============================================================
+# 🔍 Segmentation GradCAM for HybridFormerUNet
+# ============================================================
+
+import torch
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+import numpy as np
+
+class SegGradCAM:
+    """
+    GradCAM adapted for segmentation:
+    Computes gradient of the summed predicted tumor probability
+    w.r.t. a target layer (usually last encoder block).
+    Handles RNN-based bottleneck safely for batch=1.
+    """
+    def __init__(self, model, target_layer):
+        self.model = model
+        self.gradients = None
+        self.activations = None
+        
+        # Register hooks
+        target_layer.register_forward_hook(self._save_activation)
+        target_layer.register_backward_hook(self._save_gradient)
+
+    def _save_activation(self, module, input, output):
+        self.activations = output.detach()
+
+    def _save_gradient(self, module, grad_input, grad_output):
+        self.gradients = grad_output[0].detach()
+
+    def __call__(self, x):
+        """
+        x: input tensor of shape [1, C, H, W]
+        returns: GradCAM heatmap [H, W], normalized to [0,1]
+        """
+        self.model.eval()  # keep BatchNorm/Dropout safe
+        x = x.clone().detach().requires_grad_(True)
+        
+        # Disable cuDNN for RNN backward
+        with torch.backends.cudnn.flags(enabled=False):
+            self.model.zero_grad()
+            pred, _ = self.model(x)
+            # Use tumor class (class 1) score
+            score = pred[:, 1].sum()
+            score.backward()
+            
+            # Compute GradCAM
+            weights = self.gradients.mean(dim=(2,3), keepdim=True)       # global avg pool H,W
+            cam = (weights * self.activations).sum(dim=1, keepdim=True)   # weighted sum
+            cam = F.relu(cam)
+            cam = F.interpolate(cam, size=x.shape[2:], mode='bilinear', align_corners=True)
+            cam = cam.squeeze().cpu().numpy()
+            cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-6)      # normalize
+        return cam
+
+
+# -----------------------------
+# Setup GradCAM
+# -----------------------------
+# Use the last ResNeXtBlock of encoder 4
+cam_extractor = SegGradCAM(model, model.enc4[-1])
+
+# Get 4 samples from test_loader
+for imgs, masks in test_loader:
+    sample_imgs = imgs[:4]
+    sample_masks = masks[:4]
+    break
+
+mean_np = np.array([0.485, 0.456, 0.406])
+std_np  = np.array([0.229, 0.224, 0.225])
+
+fig, axes = plt.subplots(4, 5, figsize=(22, 18))
+col_titles = ['Original MRI', 'Ground Truth', 'Prediction', 'GradCAM Heatmap', 'Overlay']
+for ax, title in zip(axes[0], col_titles):
+    ax.set_title(title, fontsize=12, fontweight='bold')
+
+# -----------------------------
+# GradCAM Visualization Loop
+# -----------------------------
+for row in range(4):
+    img_tensor = sample_imgs[row:row+1].to(device)
+    mask_np    = sample_masks[row].numpy()
+    
+    # Compute GradCAM safely
+    cam = cam_extractor(img_tensor)
+    
+    # Model prediction
+    with torch.no_grad():
+        pred_logit, _ = model(img_tensor)
+    pred_prob = F.softmax(pred_logit, dim=1)[0, 1].cpu().numpy()
+    
+    # Unnormalize image for display
+    img_show = (sample_imgs[row].numpy().transpose(1,2,0) * std_np + mean_np).clip(0,1)
+    
+    # Col 0: Original
+    axes[row, 0].imshow(img_show)
+    axes[row, 0].axis('off')
+    
+    # Col 1: Ground Truth
+    axes[row, 1].imshow(mask_np, cmap='gray')
+    axes[row, 1].axis('off')
+    
+    # Col 2: Prediction heatmap
+    axes[row, 2].imshow(pred_prob, cmap='hot', vmin=0, vmax=1)
+    axes[row, 2].axis('off')
+    
+    # Col 3: GradCAM heatmap
+    axes[row, 3].imshow(cam, cmap='jet')
+    axes[row, 3].axis('off')
+    
+    # Col 4: Overlay GradCAM on image
+    cam_colored = plt.cm.jet(cam)[:, :, :3]
+    overlay = img_show * 0.6 + cam_colored * 0.4
+    axes[row, 4].imshow(overlay.clip(0,1))
+    axes[row, 4].axis('off')
+
+plt.tight_layout()
+plt.show()
+print("✅ GradCAM explainability complete!")
+
+
+
+
+# ============================================================
+# DUAL ATTENTION GATE VISUALIZATION
+# Shows what spatial regions / channels the model focuses on
+# ============================================================
+
+attention_maps = {}
+
+def get_attention_hook(name):
+    def hook(module, input, output):
+        if isinstance(module, SpatialAttention):
+            # Output is spatially weighted feature; capture the weight map
+            avg = torch.mean(input[0], dim=1, keepdim=True)
+            mx, _ = torch.max(input[0], dim=1, keepdim=True)
+            attn = torch.sigmoid(module.conv(torch.cat([avg, mx], dim=1)))
+            attention_maps[name] = attn.squeeze().detach().cpu().numpy()
+    return hook
+
+# Register hooks on decoder attention gates
+hooks = [
+    model.dec4.gate.sa.register_forward_hook(get_attention_hook('dec4')),
+    model.dec3.gate.sa.register_forward_hook(get_attention_hook('dec3')),
+    model.dec2.gate.sa.register_forward_hook(get_attention_hook('dec2')),
+]
+
+model.eval()
+with torch.no_grad():
+    test_img = sample_imgs_for_cam[0:1].to(device)
+    _ = model(test_img)
+
+for h in hooks:
+    h.remove()
+
+fig, axes = plt.subplots(1, 4, figsize=(18, 4))
+fig.suptitle('🎯 Dual Attention Gate Maps — Spatial Focus at Different Decoder Levels',
+             fontsize=13, fontweight='bold')
+
+img_show = (sample_imgs_for_cam[0].numpy().transpose(1,2,0) * std_np + mean_np).clip(0,1)
+axes[0].imshow(img_show); axes[0].set_title('Input MRI', fontweight='bold'); axes[0].axis('off')
+
+for i, (name, attn_map) in enumerate(attention_maps.items()):
+    ax = axes[i+1]
+    if attn_map.ndim > 2:
+        attn_map = attn_map[0] if attn_map.shape[0] < 10 else attn_map
+    im = ax.imshow(attn_map, cmap='hot', vmin=0, vmax=1)
+    ax.set_title(f'Attention Gate: {name}\n(Decoder Level {i+1})', fontweight='bold')
+    ax.axis('off')
+    plt.colorbar(im, ax=ax, shrink=0.8)
+
+plt.tight_layout()
+plt.savefig('attention_gates.png', dpi=150, bbox_inches='tight')
+plt.show()
+print('✅ Attention gate visualization complete!')
+
+
+
+# ============================================================
+# FINAL SUMMARY
+# ============================================================
+print('='*60)
+print('🧠 PROJECT 1: HybridFormerUNet — SUMMARY')
+print('='*60)
+print(f'Architecture: HybridFormerUNet')
+print(f'  • ResNeXt dual-branch encoder (3x3 + 5x5)')
+print(f'  • SSM bottleneck (bidirectional GRU spatial scan)')
+print(f'  • ASPP multi-scale feature pyramid')
+print(f'  • Dual Attention Gates (SE + Spatial) on skips')
+print(f'  • Deep supervision (4 auxiliary heads)')
+print(f'  • Mixed Precision (FP16) + Cosine WarmRestart LR')
+print()
+print(f'Dataset: LGG Brain MRI Segmentation')
+print(f'  • Link: kaggle.com/datasets/mateuszbuda/lgg-mri-segmentation')
+print()
+print(f'Best Validation Dice: {best_dice:.4f}')
+print(f'Test Dice:            {metrics_df["dice"].mean():.4f} ± {metrics_df["dice"].std():.4f}')
+print(f'Test IoU:             {metrics_df["iou"].mean():.4f} ± {metrics_df["iou"].std():.4f}')
+print(f'AUC-ROC (pixel):      {auc_score:.4f}')
+print(f'Average Precision:    {ap_score:.4f}')
+print()
+print('Explainability: GradCAM + Spatial Attention Gate Maps')
+print('='*60)
+
+
