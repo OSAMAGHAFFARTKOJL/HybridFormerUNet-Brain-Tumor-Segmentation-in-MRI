@@ -9,23 +9,7 @@
 
 Advanced U-Net variant combining **ResNeXt-style multi-branch convolutions**, **State Space Model (SSM) bottleneck** with bidirectional GRUs, **ASPP**, **dual attention gates**, and **deep supervision** for precise low-grade glioma (LGG) tumor segmentation in brain MRI.
 
-<p align="center">
-  <img src="assets/evaluation_results.png" width="92%" alt="Test set predictions, metrics, ROC/PR curves, sample overlays">
-</p>
 
-## Key Results (Test Set)
-
-| Metric              | Value              | Notes                          |
-|---------------------|--------------------|--------------------------------|
-| **Dice**            | ~0.89 – 0.92       | main reported score            |
-| **IoU**             | ~0.81 – 0.86       |                                |
-| **Precision**       | ~0.88 – 0.93       |                                |
-| **Recall**          | ~0.90 – 0.95       |                                |
-| **AUC-ROC** (pixel) | ~0.98              | strong class separation        |
-| **Avg Precision**   | ~0.93 – 0.96       | good on imbalanced data        |
-| Parameters          | ~32–35 M           | efficient for medical task     |
-
-> Best validation Dice usually lies in **0.91 – 0.93** range (varies slightly with seed & epochs)
 
 ## Architecture at a Glance
 
@@ -36,27 +20,13 @@ Advanced U-Net variant combining **ResNeXt-style multi-branch convolutions**, **
 - **Loss**: Hybrid CE + Dice + deep supervision auxiliary losses
 - **Optimizer & schedule**: AdamW + CosineAnnealingWarmRestarts + mixed precision (AMP)
 
-<p align="center">
-  <img src="assets/training_curves.png" width="82%" alt="Training & validation curves">
-</p>
+
 
 ## Explainability Visuals
 
 **Grad-CAM** (adapted for segmentation) + **Decoder-level spatial attention maps**
 
-<p align="center">
-  <img src="assets/gradcam_result.png" width="90%" alt="Grad-CAM examples — model focus regions">
-  <br><br>
-  <img src="assets/attention_gates.png" width="90%" alt="Spatial attention gates from decoder stages">
-</p>
-
-## Quick Start
-
-```bash
-# 1. Clone & install dependencies
-git clone https://github.com/YOUR_USERNAME/hybridformer-unet.git
-cd hybridformer-unet
-pip install -r requirements.txt
 
 # 2. Run full pipeline (downloads dataset automatically via kagglehub)
 python main.py
+
