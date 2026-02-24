@@ -1,5 +1,6 @@
 # HybridFormerUNet – Brain Tumor Segmentation
 
+
 <p align="center">
   <img src="https://img.shields.io/badge/PyTorch-2.0+-ee4c2c?logo=pytorch&logoColor=white" alt="PyTorch">
   <img src="https://img.shields.io/badge/Albumentations-1.3+-brightgreen" alt="Albumentations">
@@ -29,4 +30,5 @@ Advanced U-Net variant combining **ResNeXt-style multi-branch convolutions**, **
 
 # 2. Run full pipeline (downloads dataset automatically via kagglehub)
 python main.py
+
 
